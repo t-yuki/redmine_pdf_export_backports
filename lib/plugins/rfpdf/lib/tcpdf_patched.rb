@@ -33,6 +33,7 @@
 
 require 'tempfile'
 require 'core/rmagick'
+require 'zlib'
 
 #
 # TCPDF Class.
@@ -598,11 +599,7 @@ class TCPDF
 	#
 	def SetCompression(compress)
 		#Set page compression
-		if (respond_to?('gzcompress'))
-			@compress = compress
-		else
-			@compress = false
-		end
+		@compress = compress
 	end
   alias_method :set_compression, :SetCompression
 
@@ -2417,10 +2414,13 @@ class TCPDF
 				end
 				out(annots + ']');
 			end
+			if @pdf_version > '1.3'
+				out('/Group <</Type /Group /S /Transparency /CS /DeviceRGB>>');
+			end
 			out('/Contents ' + (@n+1).to_s + ' 0 R>>');
 			out('endobj');
 			#Page content
-			p=(@compress) ? gzcompress(@pages[n]) : @pages[n];
+			p=(@compress) ? Zlib::Deflate.deflate(@pages[n]) : @pages[n];
 			newobj();
 			out('<<' + filter + '/Length '+ p.length.to_s + '>>');
 			putstream(p);
@@ -2605,8 +2605,16 @@ class TCPDF
 	def putimages()
 		filter=(@compress) ? '/Filter /FlateDecode ' : '';
 		@images.each do |file, info| # was while(list(file, info)=each(@images))
+			putimage(info);
+			info.delete('data');
+			info.delete('smask');
+		end
+	end
+
+	def putimage(info)
+		if (!info['data'].nil?)
 			newobj();
-			@images[file]['n']=@n;
+			info['n']=@n;
 			out('<</Type /XObject');
 			out('/Subtype /Image');
 			out('/Width ' + info['w'].to_s);
@@ -2623,8 +2631,8 @@ class TCPDF
 			if (!info['f'].nil?)
 				out('/Filter /' + info['f']);
 			end
-			if (!info['parms'].nil?)
-				out(info['parms']);
+			if (!info['dp'].nil?)
+				out('/DecodeParms <<' + info['dp'] + '>>');
 			end
 			if (!info['trns'].nil? and info['trns'].kind_of?(Array))
 				trns='';
@@ -2633,14 +2641,23 @@ class TCPDF
 				end
 				out('/Mask [' + trns + ']');
 			end
+			if (!info['smask'].nil?)
+				out('/SMask ' + (@n+1).to_s + ' 0 R');
+			end
 			out('/Length ' + info['data'].length.to_s + '>>');
 			putstream(info['data']);
-      @images[file]['data']=nil
 			out('endobj');
+			# Soft mask
+			if (!info['smask'].nil?)
+				dp = '/Predictor 15 /Colors 1 /BitsPerComponent ' + info['bpc'].to_s + ' /Columns ' + info['w'].to_s;
+				smask = {'w' => info['w'], 'h' => info['h'], 'cs' => 'DeviceGray', 'bpc' => info['bpc'], 'f' => info['f'], 'dp' => dp, 'data' => info['smask']};
+				putimage(smask);
+			end
 			#Palette
 			if (info['cs']=='Indexed')
 				newobj();
-				pal=(@compress) ? gzcompress(info['pal']) : info['pal'];
+				filter = @compress ? '/Filter /FlateDecode ' : '';
+				pal=(@compress) ? Zlib::Deflate.deflate(info['pal']) : info['pal'];
 				out('<<' + filter + '/Length ' + pal.length.to_s + '>>');
 				putstream(pal);
 				out('endobj');
@@ -2931,14 +2948,14 @@ class TCPDF
 			Error('16-bit depth not supported: ' + file);
 		end
 		ct=f.read(1).unpack('C')[0];
-		if (ct==0)
+		if (ct==0 || ct==4)
 			colspace='DeviceGray';
-		elsif (ct==2)
+		elsif (ct==2 || ct==6)
 			colspace='DeviceRGB';
 		elsif (ct==3)
 			colspace='Indexed';
 		else
-			Error('Alpha channel not supported: ' + file);
+			Error('Unknown color type: ' + file);
 		end
 		if (f.read(1).unpack('C')[0] != 0)
 			Error('Unknown compression method: ' + file);
@@ -2950,7 +2967,7 @@ class TCPDF
 			Error('Interlacing not supported: ' + file);
 		end
 		f.read(4);
-		parms='/DecodeParms <</Predictor 15 /Colors ' + (ct==2 ? 3 : 1).to_s + ' /BitsPerComponent ' + bpc.to_s + ' /Columns ' + w.to_s + '>>';
+		dp='/Predictor 15 /Colors ' + (colspace == 'DeviceRGB' ? 3 : 1).to_s + ' /BitsPerComponent ' + bpc.to_s + ' /Columns ' + w.to_s + '';
 		#Scan chunks looking for palette, transparency and image data
 		pal='';
 		trns='';
@@ -2989,7 +3006,43 @@ class TCPDF
 		if (colspace=='Indexed' and pal.empty?)
 			Error('Missing palette in ' + file);
 		end
-		return {'w' => w, 'h' => h, 'cs' => colspace, 'bpc' => bpc, 'f'=>'FlateDecode', 'parms' => parms, 'pal' => pal, 'trns' => trns, 'data' => data}
+		info = {'w' => w, 'h' => h, 'cs' => colspace, 'bpc' => bpc, 'f' => 'FlateDecode', 'dp' => dp, 'pal' => pal, 'trns' => trns};
+		if (ct>=4)
+			# Extract alpha channel
+			data = Zlib::Inflate.inflate(data);
+			color = ''.force_encoding(Encoding::ASCII_8BIT);
+			alpha = ''.force_encoding(Encoding::ASCII_8BIT);
+			if (ct==4)
+				# Gray image
+				length = 2*w;
+				h.times{|i|
+					pos = (1+length)*i;
+					color += data[pos];
+					alpha += data[pos];
+					line = data[pos+1, length];
+					color += line.gsub(/(.)./m, '\1');
+					alpha += line.gsub(/.(.)/m, '\1');
+				}
+			else
+				# RGB image
+				length = 4*w;
+				h.times{|i|
+					pos = (1+length)*i;
+					color += data[pos];
+					alpha += data[pos];
+					line = data[pos+1, length];
+					color += line.gsub(/(.{3})./m, '\1');
+					alpha += line.gsub(/.{3}(.)/m, '\1');
+				}
+			end
+			data = Zlib::Deflate.deflate(color);
+			info['smask'] = Zlib::Deflate.deflate(alpha);
+			if (@pdf_version < '1.4')
+				@pdf_version = '1.4';
+			end
+		end
+		info['data'] = data;
+		return info
 	ensure
 		f.close
 	end
